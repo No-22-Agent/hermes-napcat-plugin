@@ -1,6 +1,20 @@
 MIT License
 
-Copyright (c) 2026 hermes-napcat-plugin contributors
+Copyright (c) 2026 No-22-Github (hermes-napcat-plugin refactor)
+
+This plugin is a refactor carrying code from two upstream sources, both
+MIT-licensed; their copyright notices are preserved here as the MIT license
+requires:
+
+Copyright (c) 2026 MoeOver — adapter core, napcat_call tool, and the napcat
+  skill are ported from NousResearch/hermes-agent PR #17917 (submitted to the
+  MIT-licensed hermes-agent repository, Copyright (c) 2025 Nous Research).
+
+Copyright (c) 2025 shubyi and Zhaosn — formatting.py (markdown → QQ plain
+  text) and standalone.py (OneBot HTTP API cron delivery) are derived from
+  the hermes-napcat plugin (https://github.com/Zhaosn/hermes-napcat, forked
+  from https://github.com/shubyi/hermes-napcat), whose README declares the
+  MIT license.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

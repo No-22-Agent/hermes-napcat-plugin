@@ -14,6 +14,16 @@ OneBot 11 能力（消息、群管理、好友、文件、资料……）。
 实现方式对齐 [NousResearch/hermes-agent#17917](https://github.com/NousResearch/hermes-agent/pull/17917)
 （NapCat 官方集成 PR），并以标准 Hermes 插件形式交付、适配最新 main 的插件 API。
 
+## 上游与许可证
+
+本插件为 MIT 许可（见 [LICENSE](LICENSE)），代码谱系与版权归属：
+
+| 来源 | 移植内容 | 许可证 |
+|------|----------|--------|
+| [NousResearch/hermes-agent PR #17917](https://github.com/NousResearch/hermes-agent/pull/17917)（作者 MoeOver） | `adapter.py` 主体、`tools.py`（napcat_call）、`skills/napcat/SKILL.md`、大部分测试 | hermes-agent 仓库为 MIT（Copyright 2025 Nous Research），PR 按其贡献条款同为 MIT |
+| [Zhaosn/hermes-napcat](https://github.com/Zhaosn/hermes-napcat)（fork 自 [shubyi/hermes-napcat](https://github.com/shubyi/hermes-napcat)） | `formatting.py`（Markdown→QQ 纯文本）、`standalone.py`（HTTP API 独立投递） | 仓库 README 声明 MIT（无独立 LICENSE 文件） |
+| 本仓库 | 重构、main 规范适配、审阅修复（`__init__.py`、白名单、`send_image` 覆写等） | MIT |
+
 ```
 QQ客户端 ──── NapCat ──WS拨入──▶ hermes-napcat-plugin ──▶ Hermes（大模型）
                                     │

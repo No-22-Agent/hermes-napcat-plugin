@@ -131,6 +131,31 @@ the path/URL strategy before trying to send the same media again. If the
 feedback says `upload_file_stream` is unsupported or failed, switch to an
 HTTP(S) URL, `base64://...`, or a NapCat-readable shared path.
 
+### 3.2 Tool-progress messages require the adapter's `edit_message` override
+
+The gateway's progress pump (`gateway/run_turn_runner.py::send_progress_messages`)
+drains and silently discards the *entire* progress queue for any adapter whose
+`edit_message` is still `BasePlatformAdapter.edit_message`. So on a no-edit
+surface like NapCat, `display.platforms.napcat.tool_progress: all` on its own
+delivers nothing to chat and leaves no log line — the turn looks normal and the
+queue just empties. The adapter therefore *defines* `edit_message` and returns a
+non-retryable `SendResult(success=False)`: that is the documented base-class
+contract for "this surface cannot edit", and callers fall back to sending a
+fresh message. Pair it with `tool_progress_grouping: separate` so each tool call
+becomes its own QQ message rather than an attempted in-place edit.
+
+Set it with the sanctioned CLI (the write tools refuse to touch
+`~/.hermes/config.yaml`):
+
+```
+hermes config set display.platforms.napcat.tool_progress all
+hermes config set display.platforms.napcat.tool_progress_grouping separate
+```
+
+The settings resolve live per turn, but the plugin change needs
+`systemctl --user reload hermes-gateway` (SIGUSR1 — drain-aware, so an in-flight
+turn finishes and its reply still lands first).
+
 ---
 
 ## 4. The `napcat_call` tool

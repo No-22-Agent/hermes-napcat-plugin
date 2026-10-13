@@ -1155,3 +1155,36 @@ class TestSupersededConnectionPending:
             assert not new_fut.done()  # the new connection's call survives
         finally:
             loop.close()
+
+
+# edit_message — the gateway's progress pump needs the override
+# ---------------------------------------------------------------------------
+
+
+class TestEditMessage:
+    def test_reports_a_non_retryable_failure(self):
+        adapter = _make_adapter()
+        result = _run(adapter.edit_message("10001", "m1", "hello", finalize=True))
+        assert result.success is False
+        assert result.retryable is False
+        assert "does not support editing" in result.error
+
+    def test_overrides_the_base_noop(self):
+        # An inherited base no-op makes the gateway drain and discard the whole
+        # tool-progress queue — the adapter must define its own.
+        from gateway.platforms.base import BasePlatformAdapter
+
+        assert NapCatAdapter.edit_message is not BasePlatformAdapter.edit_message
+
+    def test_sends_nothing_to_qq(self):
+        adapter = _make_adapter()
+        calls = []
+
+        async def fake(action, params, *, timeout=None):
+            calls.append((action, params))
+            return _ok()
+
+        adapter.call_action = fake
+        adapter._call_action = fake
+        _run(adapter.edit_message("10001", "m1", "hello"))
+        assert calls == []

@@ -772,6 +772,32 @@ class NapCatAdapter(BasePlatformAdapter):
                 return last_result
         return last_result
 
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """OneBot 11 has no message-edit action — always report failure.
+
+        Deliberately *defined* rather than inherited: the gateway's tool-progress
+        pump (``gateway/run_turn_runner.py::send_progress_messages``) drains and
+        discards the whole progress queue for any adapter whose ``edit_message``
+        is still the base no-op, so an inherited no-op silently swallows every
+        progress line. Returning ``success=False`` and non-retryable is the
+        documented base-class contract for "this surface cannot edit" — callers
+        send a fresh message instead, which is exactly what
+        ``tool_progress_grouping: separate`` asks for on QQ.
+        """
+        del chat_id, message_id, content, finalize, metadata
+        return SendResult(
+            success=False,
+            error="NapCat/OneBot 11 does not support editing sent messages",
+        )
+
     def _resolve_chat_target(self, chat_id: str) -> tuple[str, str]:
         """Return ``(chat_type, normalized_id)`` for a Hermes ``chat_id``.
 

@@ -11,12 +11,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from gateway.config import PlatformConfig
 
-from plugin.adapter import WS_MAX_MSG_SIZE, NapCatAdapter
+from plugin.adapter import (
+    DEFAULT_TYPING_TTL_SECONDS,
+    TYPING_KEEPALIVE_INTERVAL_SECONDS,
+    WS_MAX_MSG_SIZE,
+    NapCatAdapter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1157,6 +1163,152 @@ class TestSupersededConnectionPending:
             loop.close()
 
 
+# ---------------------------------------------------------------------------
+# Typing indicator — NapCat set_input_status + keep-alive
+# ---------------------------------------------------------------------------
+
+
+class TestTypingIndicator:
+    """``set_input_status`` is a NapCat extension with no server-side expiry.
+
+    The adapter arms it, refreshes it while the turn is live, and owns the
+    "off" switch — the gateway's single clear races the progress pump.
+    """
+
+    def _adapter(self, chat_id="10001", chat_type="private"):
+        adapter = _make_adapter()
+        adapter._mark_connected()
+        ws = MagicMock()
+        ws.closed = False
+        adapter._ws = ws
+        adapter._chat_type_map[chat_id] = chat_type
+        return adapter
+
+    @staticmethod
+    def _recorder(adapter):
+        calls = []
+
+        async def fake(action, params, *, timeout=None):
+            calls.append((action, params))
+            return _ok()
+
+        adapter.call_action = fake
+        adapter._call_action = fake
+        return calls
+
+    def test_arms_private_chat_with_string_user_id(self):
+        adapter = self._adapter()
+        calls = self._recorder(adapter)
+
+        async def scenario():
+            await adapter.send_typing("10001")
+            assert adapter._typing_task is not None  # keep-alive running
+            adapter._cancel_typing_keepalive()
+
+        _run(scenario())
+        assert calls == [("set_input_status", {"user_id": "10001", "event_type": 1})]
+
+    def test_group_chat_sends_nothing(self):
+        adapter = self._adapter(chat_id="8888", chat_type="group")
+        calls = self._recorder(adapter)
+
+        async def scenario():
+            await adapter.send_typing("8888")
+            adapter._cancel_typing_keepalive()
+
+        _run(scenario())
+        assert calls == []  # set_input_status is private-chat only
+
+    def test_stop_typing_clears_and_disarms(self):
+        adapter = self._adapter()
+        calls = self._recorder(adapter)
+
+        async def scenario():
+            await adapter.send_typing("10001")
+            await adapter.stop_typing("10001")
+            assert adapter._typing_task is None
+            assert adapter._typing_chat_id is None
+
+        _run(scenario())
+        assert [p["event_type"] for _, p in calls] == [1, 0]
+
+    def test_failure_never_raises(self):
+        adapter = self._adapter()
+
+        async def boom(action, params, *, timeout=None):
+            raise RuntimeError("websocket gone")
+
+        adapter.call_action = boom
+        adapter._call_action = boom
+
+        async def scenario():
+            await adapter.send_typing("10001")  # best-effort: must not raise
+            adapter._cancel_typing_keepalive()
+
+        _run(scenario())
+
+    def test_disconnect_disarms_the_keepalive(self):
+        adapter = self._adapter()
+
+        async def scenario():
+            await adapter.send_typing("10001")
+            assert adapter._typing_task is not None
+            await adapter.disconnect()
+            assert adapter._typing_task is None
+            assert adapter._typing_chat_id is None
+
+        _run(scenario())
+        assert adapter._typing_task is None
+
+    def test_keepalive_refreshes_while_the_turn_is_live(self, monkeypatch):
+        from plugin import adapter as adapter_module
+
+        monkeypatch.setattr(adapter_module, "TYPING_KEEPALIVE_INTERVAL_SECONDS", 0.01)
+        adapter = self._adapter()
+        calls = self._recorder(adapter)
+        adapter._typing_chat_id = "10001"
+        adapter._typing_deadline = time.monotonic() + 60
+
+        async def scenario():
+            task = asyncio.create_task(adapter._typing_keepalive())
+            await asyncio.sleep(0.05)
+            adapter._typing_chat_id = None  # gateway finished the turn
+            await asyncio.wait_for(task, timeout=1)
+
+        _run(scenario())
+        assert len(calls) >= 2
+        assert {p["event_type"] for _, p in calls} == {1}
+
+    def test_keepalive_self_clears_once_the_gateway_goes_quiet(self, monkeypatch):
+        from plugin import adapter as adapter_module
+
+        monkeypatch.setattr(adapter_module, "TYPING_KEEPALIVE_INTERVAL_SECONDS", 0.01)
+        adapter = self._adapter()
+        calls = self._recorder(adapter)
+        adapter._typing_chat_id = "10001"
+        adapter._typing_deadline = 0.0  # stale: no refresh for a full TTL
+
+        _run(adapter._typing_keepalive())
+        assert calls == [("set_input_status", {"user_id": "10001", "event_type": 0})]
+        assert adapter._typing_chat_id is None
+
+    def test_keepalive_exits_when_already_disarmed(self, monkeypatch):
+        from plugin import adapter as adapter_module
+
+        monkeypatch.setattr(adapter_module, "TYPING_KEEPALIVE_INTERVAL_SECONDS", 0.01)
+        adapter = self._adapter()
+        calls = self._recorder(adapter)
+
+        _run(adapter._typing_keepalive())  # never armed
+        assert calls == []
+
+    def test_ttl_default_and_config_override(self):
+        assert _make_adapter()._typing_ttl == DEFAULT_TYPING_TTL_SECONDS
+        assert _make_adapter(typing_ttl_seconds=5)._typing_ttl == 5
+        assert TYPING_KEEPALIVE_INTERVAL_SECONDS < DEFAULT_TYPING_TTL_SECONDS
+
+
+# ---------------------------------------------------------------------------
 # edit_message — the gateway's progress pump needs the override
 # ---------------------------------------------------------------------------
 

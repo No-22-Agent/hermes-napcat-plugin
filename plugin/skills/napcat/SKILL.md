@@ -156,6 +156,21 @@ The settings resolve live per turn, but the plugin change needs
 `systemctl --user reload hermes-gateway` (SIGUSR1 — drain-aware, so an in-flight
 turn finishes and its reply still lands first).
 
+### 3.3 The "typing" indicator is ours to clear
+
+`set_input_status` (NapCat extension, private chats only) is a *client-side*
+indicator with no server-side expiry: once armed with `event_type: 1` it stays
+on until something sends `event_type: 0`. The gateway arms it at turn start and
+re-arms it after every progress send, while its one final clear
+(`gateway/run_turn.py`, before the response is shaped and delivered) can lose a
+race against a late progress tick — that is how the indicator gets stuck on
+after the last reply. So the adapter owns the off switch: every `send_typing`
+also arms a keep-alive that re-asserts `event_type: 1` every
+`TYPING_KEEPALIVE_INTERVAL_SECONDS` and clears the indicator once the gateway has
+been silent for `self._typing_ttl` (`DEFAULT_TYPING_TTL_SECONDS`, override with
+`NAPCAT_TYPING_TTL_SECONDS` or `extra.typing_ttl_seconds`). `stop_typing`
+cancels it first, then clears. Never trust the gateway's clear alone.
+
 ---
 
 ## 4. The `napcat_call` tool

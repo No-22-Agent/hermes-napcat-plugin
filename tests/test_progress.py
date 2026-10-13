@@ -573,6 +573,11 @@ class TestBatchedProgress:
             ws = _connected(adapter)
             adapter._typing_chat_id = "10001"
             await _note(adapter, "terminal", None)          # no args at all
+            # Let flush #1 land before arming #2: on Python 3.11 one sleep(0)
+            # doesn't guarantee the call_soon_threadsafe enqueue ran, so
+            # back-to-back size-1 notes can overlap their flush tasks and the
+            # second bails on the reentrancy guard (see _flush_progress_batch).
+            await _flush_pending()
             await _note(adapter, None, {"weird": object()})  # unknown tool + odd args
             await _flush_pending()
             # batch_size=1 → each call flushes on its own; the point is that both

@@ -131,6 +131,46 @@ the path/URL strategy before trying to send the same media again. If the
 feedback says `upload_file_stream` is unsupported or failed, switch to an
 HTTP(S) URL, `base64://...`, or a NapCat-readable shared path.
 
+### 3.2 Tool-progress messages require the adapter's `edit_message` override
+
+The gateway's progress pump (`gateway/run_turn_runner.py::send_progress_messages`)
+drains and silently discards the *entire* progress queue for any adapter whose
+`edit_message` is still `BasePlatformAdapter.edit_message`. So on a no-edit
+surface like NapCat, `display.platforms.napcat.tool_progress: all` on its own
+delivers nothing to chat and leaves no log line — the turn looks normal and the
+queue just empties. The adapter therefore *defines* `edit_message` and returns a
+non-retryable `SendResult(success=False)`: that is the documented base-class
+contract for "this surface cannot edit", and callers fall back to sending a
+fresh message. Pair it with `tool_progress_grouping: separate` so each tool call
+becomes its own QQ message rather than an attempted in-place edit.
+
+Set it with the sanctioned CLI (the write tools refuse to touch
+`~/.hermes/config.yaml`):
+
+```
+hermes config set display.platforms.napcat.tool_progress all
+hermes config set display.platforms.napcat.tool_progress_grouping separate
+```
+
+The settings resolve live per turn, but the plugin change needs
+`systemctl --user reload hermes-gateway` (SIGUSR1 — drain-aware, so an in-flight
+turn finishes and its reply still lands first).
+
+### 3.3 The "typing" indicator is ours to clear
+
+`set_input_status` (NapCat extension, private chats only) is a *client-side*
+indicator with no server-side expiry: once armed with `event_type: 1` it stays
+on until something sends `event_type: 0`. The gateway arms it at turn start and
+re-arms it after every progress send, while its one final clear
+(`gateway/run_turn.py`, before the response is shaped and delivered) can lose a
+race against a late progress tick — that is how the indicator gets stuck on
+after the last reply. So the adapter owns the off switch: every `send_typing`
+also arms a keep-alive that re-asserts `event_type: 1` every
+`TYPING_KEEPALIVE_INTERVAL_SECONDS` and clears the indicator once the gateway has
+been silent for `self._typing_ttl` (`DEFAULT_TYPING_TTL_SECONDS`, override with
+`NAPCAT_TYPING_TTL_SECONDS` or `extra.typing_ttl_seconds`). `stop_typing`
+cancels it first, then clears. Never trust the gateway's clear alone.
+
 ---
 
 ## 4. The `napcat_call` tool

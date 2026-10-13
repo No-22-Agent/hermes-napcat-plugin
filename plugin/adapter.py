@@ -86,6 +86,17 @@ WS_MAX_MSG_SIZE = 4 * 1024 * 1024  # bounded frame cap — never max_msg_size=0
 DEFAULT_STREAM_UPLOAD_CHUNK_SIZE = 64 * 1024
 DEFAULT_STREAM_UPLOAD_RETENTION_MS = 30 * 1000
 
+# QQ's "typing" status (``set_input_status``) is a client-side indicator with no
+# server-side expiry: once armed with event_type 1 it stays on until something
+# sends event_type 0. The gateway arms it at turn start and re-arms it after
+# every progress send, but its final clear (``gateway/run_turn.py``, before the
+# response is shaped and delivered) can lose a race against a late progress tick
+# — which is how the indicator ended up stuck after a reply. So instead of
+# trusting a single clear, keep a bounded keep-alive: refresh the indicator while
+# the turn is live and self-clear once the gateway has been silent this long.
+DEFAULT_TYPING_TTL_SECONDS = 120
+TYPING_KEEPALIVE_INTERVAL_SECONDS = 30
+
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
@@ -201,6 +212,13 @@ class NapCatAdapter(BasePlatformAdapter):
             extra.get("stream_upload_chunk_size"), DEFAULT_STREAM_UPLOAD_CHUNK_SIZE)
         self._stream_upload_retention_ms = self._coerce_positive_int(
             extra.get("stream_upload_retention_ms"), DEFAULT_STREAM_UPLOAD_RETENTION_MS)
+        self._typing_ttl = self._coerce_positive_int(
+            _extra_or_secret(extra, "typing_ttl_seconds", "NAPCAT_TYPING_TTL_SECONDS", None),
+            DEFAULT_TYPING_TTL_SECONDS)
+        # Typing-indicator keep-alive state (see send_typing / _typing_keepalive).
+        self._typing_chat_id: Optional[str] = None
+        self._typing_deadline: float = 0.0
+        self._typing_task: Optional["asyncio.Task[None]"] = None
 
     # ------------------------------------------------------------------
     # Access policy
@@ -281,6 +299,7 @@ class NapCatAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._mark_disconnected()
+        self._cancel_typing_keepalive()
 
         if self._ws is not None:
             try:
@@ -771,6 +790,32 @@ class NapCatAdapter(BasePlatformAdapter):
             if not last_result.success:
                 return last_result
         return last_result
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """OneBot 11 has no message-edit action — always report failure.
+
+        Deliberately *defined* rather than inherited: the gateway's tool-progress
+        pump (``gateway/run_turn_runner.py::send_progress_messages``) drains and
+        discards the whole progress queue for any adapter whose ``edit_message``
+        is still the base no-op, so an inherited no-op silently swallows every
+        progress line. Returning ``success=False`` and non-retryable is the
+        documented base-class contract for "this surface cannot edit" — callers
+        send a fresh message instead, which is exactly what
+        ``tool_progress_grouping: separate`` asks for on QQ.
+        """
+        del chat_id, message_id, content, finalize, metadata
+        return SendResult(
+            success=False,
+            error="NapCat/OneBot 11 does not support editing sent messages",
+        )
 
     def _resolve_chat_target(self, chat_id: str) -> tuple[str, str]:
         """Return ``(chat_type, normalized_id)`` for a Hermes ``chat_id``.
@@ -1416,7 +1461,78 @@ class NapCatAdapter(BasePlatformAdapter):
         return strip_markdown(content)
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict] = None) -> None:
-        """QQ OneBot has no typing indicator — no-op."""
+        """Show "typing" in a QQ private chat via NapCat's ``set_input_status``.
+
+        ``set_input_status`` is a NapCat extension (tag 系统扩展), NOT core
+        OneBot 11 — hence the generic "OneBot has no typing indicator"
+        assumption upstream is wrong for NapCat.  Shape:
+        ``{user_id: <string qq>, event_type: 1|0}`` (1 = typing, 0 = stopped).
+        Only private chats are supported by this build, so groups stay a no-op.
+
+        Every arm also (re)starts the keep-alive below: QQ never expires the
+        indicator on its own, and the gateway's single final clear races the
+        progress pump — so the adapter owns the "off" switch.
+        """
+        await self._set_input_status(chat_id, 1)
+        self._typing_chat_id = chat_id
+        self._typing_deadline = time.monotonic() + self._typing_ttl
+        if self._typing_task is None or self._typing_task.done():
+            self._typing_task = asyncio.create_task(self._typing_keepalive())
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Clear the QQ "typing" indicator (``set_input_status`` event_type 0)."""
+        self._cancel_typing_keepalive()
+        await self._set_input_status(chat_id, 0)
+
+    def _cancel_typing_keepalive(self) -> None:
+        """Disarm the keep-alive; never leave a live task behind."""
+        self._typing_chat_id = None
+        self._typing_deadline = 0.0
+        task, self._typing_task = self._typing_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _typing_keepalive(self) -> None:
+        """Re-assert the indicator while a turn is live; clear it once quiet.
+
+        ``event_type 1`` is re-sent every ``TYPING_KEEPALIVE_INTERVAL_SECONDS``
+        so a long turn keeps QQ's indicator fresh, and the indicator is cleared
+        when the gateway has not refreshed it for ``self._typing_ttl`` seconds
+        (turn over, gateway restarted, progress pump gone). Bounded staleness
+        instead of "stuck until the next turn".
+        """
+        try:
+            while True:
+                await asyncio.sleep(TYPING_KEEPALIVE_INTERVAL_SECONDS)
+                chat_id = self._typing_chat_id
+                if chat_id is None:
+                    return
+                if time.monotonic() >= self._typing_deadline:
+                    # Gateway went quiet — the turn is over (or never cleared us).
+                    self._typing_chat_id, self._typing_deadline = None, 0.0
+                    await self._set_input_status(chat_id, 0)
+                    return
+                await self._set_input_status(chat_id, 1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("[%s] typing keep-alive stopped", self.name, exc_info=True)
+
+    async def _set_input_status(self, chat_id: str, event_type: int) -> None:
+        """Best-effort typing indicator; never let it break a reply."""
+        chat_type, normalized_id = self._resolve_chat_target(chat_id)
+        if chat_type != "private":
+            return
+        try:
+            await self.call_action(
+                "set_input_status",
+                {"user_id": str(normalized_id), "event_type": event_type},
+            )
+        except Exception:
+            logger.debug(
+                "[%s] set_input_status(%s) failed for %s",
+                self.name, event_type, chat_id, exc_info=True,
+            )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Resolve a chat's display name best-effort via OneBot lookups."""

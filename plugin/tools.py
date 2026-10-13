@@ -13,6 +13,7 @@ holds a connected NapCat adapter.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Dict
 
@@ -109,18 +110,32 @@ async def _do_napcat_call(action: str, params: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
-async def _napcat_call_handler(args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-    """Registry entrypoint (``is_async=True``): awaited by the tool dispatcher."""
+def _as_tool_result(payload: Dict[str, Any]) -> str:
+    """JSON-encode a tool payload — the registry accepts ``str`` results only."""
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+async def _napcat_call_handler(args: Dict[str, Any], **kwargs) -> str:
+    """Registry entrypoint (``is_async=True``): awaited by the tool dispatcher.
+
+    The registry result contract (Hermes commit f8361d29c8, #61787) accepts only a
+    ``str`` or the ``_multimodal`` envelope — a bare ``dict`` is rejected with
+    ``tool_result_contract``. So every return path is JSON-encoded here.
+    """
     del kwargs
     action = args.get("action")
     if not action or not isinstance(action, str):
-        return {"error": "'action' is required and must be an OneBot 11 endpoint name (string)."}
+        return _as_tool_result(
+            {"error": "'action' is required and must be an OneBot 11 endpoint name (string)."}
+        )
     params = args.get("params")
     if params is None:
         params = {}
     if not isinstance(params, dict):
-        return {"error": "'params' must be an object/dict of action parameters."}
-    return await _do_napcat_call(action, params)
+        return _as_tool_result(
+            {"error": "'params' must be an object/dict of action parameters."}
+        )
+    return _as_tool_result(await _do_napcat_call(action, params))
 
 
 # ----------------------------------------------------------------------

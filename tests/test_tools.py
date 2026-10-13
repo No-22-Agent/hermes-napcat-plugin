@@ -4,6 +4,7 @@ adapted to the plugin's async handler and ``_live_adapter`` reach-in)."""
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import MagicMock
 
 import plugin.tools as tools
@@ -11,6 +12,16 @@ import plugin.tools as tools
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def _payload(result):
+    """Decode a handler result.
+
+    The registry result contract accepts ``str`` only (see
+    ``TestRegistryResultContract``), so the handler JSON-encodes every payload.
+    """
+    assert isinstance(result, str), f"registry wants str results, got {type(result)}"
+    return json.loads(result)
 
 
 class _FakeAdapter:
@@ -34,25 +45,65 @@ class _FakeAdapter:
 
 class TestHandlerValidation:
     def test_missing_action(self):
-        result = _run(tools._napcat_call_handler({}))
+        result = _payload(_run(tools._napcat_call_handler({})))
         assert "error" in result
         assert "action" in result["error"]
 
     def test_non_string_action(self):
-        result = _run(tools._napcat_call_handler({"action": 123}))
+        result = _payload(_run(tools._napcat_call_handler({"action": 123})))
         assert "error" in result
 
     def test_non_dict_params(self):
-        result = _run(tools._napcat_call_handler({"action": "get_status", "params": "oops"}))
+        result = _payload(
+            _run(tools._napcat_call_handler({"action": "get_status", "params": "oops"}))
+        )
         assert "error" in result
         assert "params" in result["error"]
 
     def test_params_default_empty(self, monkeypatch):
         adapter = _FakeAdapter()
         monkeypatch.setattr(tools, "_get_napcat_adapter", lambda: adapter)
-        result = _run(tools._napcat_call_handler({"action": "get_status"}))
+        result = _payload(_run(tools._napcat_call_handler({"action": "get_status"})))
         assert result.get("success") is True
         assert adapter.calls == [("get_status", {})]
+
+
+# ---------------------------------------------------------------------------
+# Registry result contract — str results only
+# ---------------------------------------------------------------------------
+
+
+class TestRegistryResultContract:
+    """The registry takes ``str`` tool results (Hermes commit f8361d29c8, #61787).
+
+    A bare ``dict`` return is rejected with ``tool_result_contract`` and the
+    model never sees the payload, so every handler path must be JSON-encoded.
+    """
+
+    def test_validation_error_is_a_json_string(self):
+        raw = _run(tools._napcat_call_handler({}))
+        assert isinstance(raw, str)
+        assert "action" in json.loads(raw)["error"]
+
+    def test_success_is_a_json_string(self, monkeypatch):
+        adapter = _FakeAdapter()
+        monkeypatch.setattr(tools, "_get_napcat_adapter", lambda: adapter)
+        raw = _run(tools._napcat_call_handler({"action": "get_status"}))
+        assert isinstance(raw, str)
+        assert json.loads(raw)["success"] is True
+
+    def test_dispatch_failure_is_a_json_string(self, monkeypatch):
+        monkeypatch.setattr(tools, "_get_napcat_adapter", lambda: None)
+        raw = _run(tools._napcat_call_handler({"action": "get_status"}))
+        assert isinstance(raw, str)
+        assert "gateway" in json.loads(raw)["error"]
+
+    def test_non_ascii_survives_the_round_trip(self, monkeypatch):
+        adapter = _FakeAdapter(response={"status": "ok", "retcode": 0, "data": {"nick": "柯莉耶"}})
+        monkeypatch.setattr(tools, "_get_napcat_adapter", lambda: adapter)
+        raw = _run(tools._napcat_call_handler({"action": "get_login_info"}))
+        assert "柯莉耶" in raw  # ensure_ascii=False keeps QQ nicknames readable
+        assert json.loads(raw)["data"]["nick"] == "柯莉耶"
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ file sends, and message de-duplication.
 Module layout:
     __init__.py     registration entry (this file) + config probes
     adapter.py      NapCatAdapter — reverse-WS transport / inbound / outbound
+    progress.py     batched tool-progress lines (QQ cannot edit messages)
     tools.py        napcat_call — generic OneBot 11 action tool
     standalone.py   out-of-process cron delivery via NapCat's HTTP API
     formatting.py   markdown → QQ plain text
@@ -27,6 +28,7 @@ plugin never mutates the process environment.
 from __future__ import annotations
 
 import logging
+import weakref
 from pathlib import Path
 
 from gateway.platforms._shared import (
@@ -100,6 +102,44 @@ def _env_enablement() -> dict | None:
     return seed or None
 
 
+# ── Tool-progress batching wiring (see progress.py) ──────────────────────────
+
+# Live adapters.  Weak: a hook lookup must never keep a disconnected adapter
+# alive, and the gateway builds exactly one adapter per platform entry anyway.
+_ADAPTERS: "weakref.WeakSet[NapCatAdapter]" = weakref.WeakSet()
+
+
+def _build_adapter(config) -> NapCatAdapter:
+    """``adapter_factory``: build the adapter and make it reachable from hooks."""
+    adapter = NapCatAdapter(config)
+    try:
+        _ADAPTERS.add(adapter)
+    except TypeError:  # pragma: no cover - NapCatAdapter is weak-referenceable
+        pass
+    return adapter
+
+
+def _on_pre_tool_call(tool_name=None, args=None, **kwargs) -> None:
+    """``pre_tool_call`` observer: offer every tool call to the live adapters.
+
+    Observer-only — the return value is ignored by the hook dispatcher, and this
+    callback stays trivial because ``pre_tool_call`` runs on the tool hot path
+    (a raising or slow callback there can veto the tool call).  Each adapter
+    decides for itself whether batching is on, a turn is live, and the line is
+    worth buffering; when batching is off this is one attribute check.
+
+    Registered unconditionally: the hook dispatcher is only consulted when
+    ``has_hook`` is true, so a single registration is what makes the callback
+    reachable at all — the per-adapter switch stays in config.
+    """
+    del kwargs
+    for adapter in list(_ADAPTERS):
+        try:
+            adapter.note_tool_call(tool_name, args)
+        except Exception:  # never let progress break a tool call
+            logger.debug("NapCat: tool-progress note failed", exc_info=True)
+
+
 # ── Plugin entry point ────────────────────────────────────────────────────────
 
 def register(ctx) -> None:
@@ -107,7 +147,7 @@ def register(ctx) -> None:
     ctx.register_platform(
         name="napcat",
         label="NapCat (QQ)",
-        adapter_factory=lambda cfg: NapCatAdapter(cfg),
+        adapter_factory=_build_adapter,
         check_fn=check_napcat_requirements,
         ensure_deps_fn=ensure_napcat_deps,
         validate_config=validate_config,
@@ -137,6 +177,18 @@ def register(ctx) -> None:
     )
 
     _tools.register_tools(ctx)
+
+    # Tool-progress batching needs tool-call visibility, which only the plugin
+    # hook API provides.  Guarded: older/embedded hosts may not expose it, and a
+    # missing hook must degrade to "no batched progress", never a failed load.
+    register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        try:
+            register_hook("pre_tool_call", _on_pre_tool_call)
+        except Exception:
+            logger.warning("NapCat: could not register the pre_tool_call hook", exc_info=True)
+    else:  # pragma: no cover - every supported host exposes register_hook
+        logger.debug("NapCat: plugin host exposes no register_hook — batching inactive")
 
     skill_path = Path(__file__).parent / "skills" / "napcat" / "SKILL.md"
     if skill_path.exists():

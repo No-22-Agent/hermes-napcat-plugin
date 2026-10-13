@@ -70,6 +70,14 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 
 from .formatting import strip_markdown
+from .progress import (
+    DEFAULT_PROGRESS_BATCH_SIZE,
+    DEFAULT_PROGRESS_BATCH_WINDOW_S,
+    ProgressBuffer,
+    format_tool_line,
+    merge_progress_lines,
+    truthy as _truthy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +146,37 @@ def _config_token(config: PlatformConfig, extra: dict) -> str:
         or _get_scoped_secret("NAPCAT_TOKEN")
         or ""
     ).strip()
+
+
+def _read_user_config() -> Dict[str, Any]:
+    """Read this profile's ``config.yaml`` (best-effort) for display lookups.
+
+    Deliberately NOT ``gateway.run._load_gateway_config``: importing
+    ``gateway.run`` pulls the whole gateway process launcher into whatever
+    imports this adapter (the plugin's own test suite dies mid-run on it), and a
+    cosmetic warning about a display setting has no business doing that.  Only
+    the parsed mapping is needed — a missing file, an unreadable one, or one that
+    will not parse returns ``{}`` so the caller degrades to "no warning".
+    """
+    try:
+        home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+        path = Path(home) / "config.yaml"
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        import yaml  # Hermes ships ruamel; plain PyYAML is the fallback.
+
+        loaded = yaml.safe_load(raw)
+    except Exception:
+        try:
+            from ruamel.yaml import YAML
+
+            loaded = YAML(typ="safe").load(raw)
+        except Exception:
+            logger.debug("NapCat: user config present but unreadable as YAML")
+            return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 class NapCatAdapter(BasePlatformAdapter):
@@ -220,6 +259,28 @@ class NapCatAdapter(BasePlatformAdapter):
         self._typing_deadline: float = 0.0
         self._typing_task: Optional["asyncio.Task[None]"] = None
 
+        # Batched tool progress (progress_batch / NAPCAT_PROGRESS_BATCH). OFF by
+        # default: it only makes sense next to
+        # ``display.platforms.napcat.tool_progress: off`` — the gateway rail this
+        # replaces — and the plugin cannot force a display setting from here, so
+        # the operator opts in (see progress.py for the whole rationale).
+        self._progress_batch_enabled = _truthy(
+            _extra_or_secret(extra, "progress_batch", "NAPCAT_PROGRESS_BATCH", ""))
+        self._progress_batch_size = self._coerce_positive_int(
+            _extra_or_secret(extra, "progress_batch_size", "NAPCAT_PROGRESS_BATCH_SIZE", None),
+            DEFAULT_PROGRESS_BATCH_SIZE)
+        self._progress_batch_window_s = self._coerce_positive_float(
+            _extra_or_secret(extra, "progress_batch_window_s", "NAPCAT_PROGRESS_BATCH_WINDOW_S", None),
+            DEFAULT_PROGRESS_BATCH_WINDOW_S)
+        self._progress = ProgressBuffer()
+        self._progress_timer: Optional[asyncio.TimerHandle] = None
+        self._progress_task: Optional["asyncio.Task[None]"] = None
+        self._progress_flushing = False
+        self._progress_rail_warned = False
+        # The pre_tool_call hook runs on the agent thread; note_tool_call hands
+        # work to this loop (captured in connect()).
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
     # ------------------------------------------------------------------
     # Access policy
     # ------------------------------------------------------------------
@@ -254,6 +315,13 @@ class NapCatAdapter(BasePlatformAdapter):
                 retryable=True,
             )
             return False
+
+        # Batching is fed from the pre_tool_call hook (agent thread) and must
+        # hand work to the adapter's loop.
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - connect() is always awaited
+            self._loop = None
 
         if not self._token:
             self._set_fatal_error(
@@ -300,6 +368,10 @@ class NapCatAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._mark_disconnected()
         self._cancel_typing_keepalive()
+        # Pending progress dies with the connection: a later reconnect must not
+        # deliver lines from a turn the user has already moved past.
+        self._cancel_progress_timer()
+        self._progress.clear()
 
         if self._ws is not None:
             try:
@@ -778,6 +850,12 @@ class NapCatAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True)
 
+        # Pending tool lines ride along on THIS message rather than costing a
+        # second QQ bubble: lines on top, one separator, then the text (see
+        # progress.py). Still order-safe — the lines precede the sentence inside
+        # one send, so a late flush cannot invert the turn.
+        content = self._merge_progress_prefix(chat_id, content)
+
         chunks = self.truncate_message(strip_markdown(content), self.MAX_MESSAGE_LENGTH)
         last_result = SendResult(success=False, error="No chunks")
         for idx, chunk in enumerate(chunks):
@@ -1110,6 +1188,7 @@ class NapCatAdapter(BasePlatformAdapter):
         extra_data: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an image / voice / video segment together with optional caption."""
+        await self._flush_progress_before_send(chat_id)
         if self._ws is None or getattr(self._ws, "closed", True):
             return SendResult(success=False, error="NapCat is not connected", retryable=True)
 
@@ -1447,6 +1526,19 @@ class NapCatAdapter(BasePlatformAdapter):
         return parsed if parsed > 0 else default
 
     @staticmethod
+    def _coerce_positive_float(value: Any, default: float) -> float:
+        """Positive float config value (seconds); anything unusable → *default*.
+
+        Durations are floats on purpose: a fractional window is legitimate and an
+        int-only parse would silently fall back to the 30 s default.
+        """
+        try:
+            parsed = float(str(value).strip())
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
+
+    @staticmethod
     def _is_retryable_runtime_send_error(error: str) -> bool:
         """Return True only for failures that happen before sending anything."""
         lowered = error.lower()
@@ -1480,8 +1572,13 @@ class NapCatAdapter(BasePlatformAdapter):
             self._typing_task = asyncio.create_task(self._typing_keepalive())
 
     async def stop_typing(self, chat_id: str) -> None:
-        """Clear the QQ "typing" indicator (``set_input_status`` event_type 0)."""
+        """Clear the QQ "typing" indicator (``set_input_status`` event_type 0).
+
+        The gateway clears typing at end of turn, just before it shapes the final
+        reply — the last chance to land a partial batch above that reply.
+        """
         self._cancel_typing_keepalive()
+        await self._flush_progress_batch()
         await self._set_input_status(chat_id, 0)
 
     def _cancel_typing_keepalive(self) -> None:
@@ -1509,6 +1606,9 @@ class NapCatAdapter(BasePlatformAdapter):
                     return
                 if time.monotonic() >= self._typing_deadline:
                     # Gateway went quiet — the turn is over (or never cleared us).
+                    # The 30s window timer normally flushed already; this is the
+                    # backstop so a pending batch is never dropped on the floor.
+                    await self._flush_progress_batch()
                     self._typing_chat_id, self._typing_deadline = None, 0.0
                     await self._set_input_status(chat_id, 0)
                     return
@@ -1533,6 +1633,179 @@ class NapCatAdapter(BasePlatformAdapter):
                 "[%s] set_input_status(%s) failed for %s",
                 self.name, event_type, chat_id, exc_info=True,
             )
+
+    # ------------------------------------------------------------------
+    # Batched tool progress (plugin-side; see progress.py for the policy)
+    # ------------------------------------------------------------------
+
+    def note_tool_call(self, tool_name: Optional[str], args: Optional[Any] = None) -> None:
+        """Record a tool call for the next batch.  Safe to call from any thread.
+
+        The plugin's ``pre_tool_call`` hook (agent thread) calls this.  Kept
+        deliberately tiny: that hook is on the policy path, where a raising or
+        slow callback can veto the tool call, so nothing here touches the
+        network, the buffer, or the loop's state directly.
+        """
+        if not self._progress_batch_enabled:
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(self._enqueue_progress, tool_name, args)
+        except RuntimeError:  # loop closed between the check and the call
+            logger.debug("[%s] progress event dropped (loop closing)", self.name)
+
+    def _enqueue_progress(self, tool_name: Optional[str], args: Optional[Any]) -> None:
+        """Loop side: append a rendered line and (re)arm the flush timer."""
+        if not self._progress_batch_enabled or not self.is_connected:
+            return
+        if not self._progress_rail_warned:
+            self._progress_rail_warned = True
+            self._warn_if_gateway_progress_rail_on()
+        # The gateway arms typing at turn start and clears it at turn end, so it
+        # is the adapter's only "a turn is live, in this chat" signal.  No live
+        # turn (cron delivery, startup notice) means there is no progress rail
+        # to batch into.
+        chat_id = self._typing_chat_id
+        if not chat_id:
+            return
+        now = time.monotonic()
+        if self._progress.chat_id and self._progress.chat_id != chat_id:
+            self._progress.clear()
+        self._progress.add(chat_id, format_tool_line(tool_name, args), now)
+        self._rearm_typing_for_progress()
+        if len(self._progress) >= self._progress_batch_size:
+            # Full buffer: flush on this tick. An already-armed window timer must
+            # not push the flush out by the rest of the window.
+            self._flush_now()
+            return
+        # The window is measured from the FIRST pending line, so later calls in
+        # the same batch may only shorten the deadline, never extend it.
+        self._schedule_progress_flush(self._progress_batch_window_s - self._progress.age(now))
+
+    def _rearm_typing_for_progress(self) -> None:
+        """Keep QQ's "typing" indicator alive while a batch waits."""
+        if not self._typing_chat_id:
+            return
+        self._typing_deadline = max(
+            self._typing_deadline, time.monotonic() + self._typing_ttl)
+        if self._typing_task is None or self._typing_task.done():
+            self._typing_task = asyncio.create_task(self._typing_keepalive())
+
+    def _schedule_progress_flush(self, delay: float) -> None:
+        """Arm the window timer; an earlier already-armed deadline wins."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        delay = max(0.0, delay)
+        armed = self._progress_timer
+        if armed is not None and not armed.cancelled() and armed.when() <= loop.time() + delay:
+            return  # something sooner is already queued
+        self._cancel_progress_timer()
+        self._progress_timer = loop.call_later(delay, self._spawn_progress_flush)
+
+    def _flush_now(self) -> None:
+        """Flush on this loop tick, cancelling any window timer."""
+        self._cancel_progress_timer()
+        self._spawn_progress_flush()
+
+    def _spawn_progress_flush(self) -> None:
+        """Timer callback: run the flush as a task, held on ``self``.
+
+        A bare ``asyncio.create_task`` keeps only a weak reference, so the flush
+        could be garbage-collected mid-flight.
+        """
+        self._progress_timer = None
+        try:
+            self._progress_task = asyncio.create_task(self._flush_progress_batch())
+        except RuntimeError:  # pragma: no cover - loop gone during shutdown
+            logger.debug("[%s] progress flush skipped (no running loop)", self.name)
+
+    def _cancel_progress_timer(self) -> None:
+        timer, self._progress_timer = self._progress_timer, None
+        if timer is not None:
+            timer.cancel()
+
+    def _merge_progress_prefix(self, chat_id: str, content: str) -> str:
+        """Fold a pending batch into *content* (one message, lines above the text).
+
+        Nothing is merged when there is no text to attach to — an empty send is a
+        no-op, and the leftovers still flush at turn end — or when the pending
+        lines belong to a different chat's turn.
+        """
+        if not content or not content.strip() or self._progress.empty:
+            return content
+        if self._progress.chat_id and chat_id != self._progress.chat_id:
+            return content
+        self._cancel_progress_timer()
+        _, lines = self._progress.take()
+        return merge_progress_lines(lines, content) if lines else content
+
+    async def _flush_progress_before_send(self, chat_id: Optional[str] = None) -> None:
+        """Flush a pending batch as its own message ahead of an outbound send.
+
+        Media sends use this (a caption is not the agent's prose, so its progress
+        lines stay a separate bubble); plain text goes through
+        :meth:`_merge_progress_prefix` instead and carries the lines with it.
+        """
+        if self._progress.empty:
+            return
+        if chat_id and self._progress.chat_id and chat_id != self._progress.chat_id:
+            # Those lines belong to another chat's turn — not this message's.
+            return
+        await self._flush_progress_batch()
+
+    async def _flush_progress_batch(self) -> None:
+        """Send the pending lines as ONE QQ message.
+
+        Goes straight to ``_send_chunk`` rather than ``send()``: an outbound text
+        send flushes the buffer first, so routing the flush back through it would
+        recurse (and the reentrancy guard would drop the batch).
+        """
+        self._cancel_progress_timer()
+        if self._progress.empty or self._progress_flushing:
+            return
+        chat_id, lines = self._progress.take()
+        if not chat_id or not lines:
+            return
+        self._progress_flushing = True
+        try:
+            result = await self._send_chunk(chat_id, "\n".join(lines), reply_to=None)
+            if not result.success:
+                logger.debug(
+                    "[%s] progress batch (%d line(s)) not delivered: %s",
+                    self.name, len(lines), result.error,
+                )
+        except Exception:
+            logger.debug("[%s] progress batch flush failed", self.name, exc_info=True)
+        finally:
+            self._progress_flushing = False
+
+    def _warn_if_gateway_progress_rail_on(self) -> None:
+        """Warn when batching is on but the gateway's own tool rail is too.
+
+        Both rails on means every tool call produces a second, unbuffered QQ
+        message — exactly the noise batching exists to remove.  Best-effort: the
+        display setting lives in the user config, read straight from
+        ``config.yaml`` (see :func:`_read_user_config`) and stay silent when it
+        cannot be read.
+        """
+        try:
+            from gateway.display_config import resolve_tool_progress
+
+            mode, _explicit = resolve_tool_progress(_read_user_config(), "napcat", None)
+        except Exception:
+            logger.debug("[%s] could not read the display tool_progress setting", self.name,
+                         exc_info=True)
+            return
+        if str(mode or "").strip().lower() == "off":
+            return
+        logger.warning(
+            "[%s] progress_batch is on but display.platforms.napcat.tool_progress=%r — "
+            'set it to "off", otherwise every tool call is also sent unbuffered by the gateway',
+            self.name, mode,
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Resolve a chat's display name best-effort via OneBot lookups."""

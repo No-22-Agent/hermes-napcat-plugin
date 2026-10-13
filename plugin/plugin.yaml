@@ -1,7 +1,7 @@
 name: napcat
 label: NapCat (QQ)
 kind: platform
-version: 1.0.0
+version: 1.1.0
 description: >
   NapCat / OneBot 11 (QQ) gateway adapter for Hermes Agent. Runs a
   reverse-WebSocket server that NapCat dials into (Universal role: API +
@@ -57,4 +57,16 @@ optional_env:
   - name: NAPCAT_HOME_CHANNEL
     description: "Chat ID for cron / notification delivery (a QQ number or group:<group_id>)"
     prompt: "Home channel (optional)"
+    password: false
+  - name: NAPCAT_PROGRESS_BATCH
+    description: "Batched tool progress: buffer tool calls and send ONE QQ message per batch instead of one message per call (pairs with display.platforms.napcat.tool_progress: off). Also settable as platforms.napcat.extra.progress_batch"
+    prompt: "Batch tool progress? (true/false)"
+    password: false
+  - name: NAPCAT_PROGRESS_BATCH_SIZE
+    description: "Batched tool progress: flush once the buffer holds this many tool calls (default 5)"
+    prompt: "Progress batch size (default 5)"
+    password: false
+  - name: NAPCAT_PROGRESS_BATCH_WINDOW_S
+    description: "Batched tool progress: also flush a partial buffer this many seconds after its first line (default 30)"
+    prompt: "Progress batch window seconds (default 30)"
     password: false

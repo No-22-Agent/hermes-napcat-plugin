@@ -20,6 +20,7 @@ class _FakeCtx:
     def __init__(self):
         self.tools: list[dict] = []
         self.skills: list[tuple[str, str]] = []
+        self.hooks: dict[str, list] = {}
         self.platform: dict | None = None
 
     def register_platform(self, **kwargs):
@@ -43,6 +44,9 @@ class _FakeCtx:
     def register_skill(self, name, path, **kwargs):
         self.skills.append((name, str(path)))
 
+    def register_hook(self, hook_name, callback):
+        self.hooks.setdefault(hook_name, []).append(callback)
+
 
 def test_register_wires_platform_tool_and_skill():
     ctx = _FakeCtx()
@@ -63,6 +67,9 @@ def test_register_wires_platform_tool_and_skill():
     assert callable(ctx.platform["adapter_factory"])
     assert callable(ctx.platform["check_fn"])
     assert callable(ctx.platform["validate_config"])
+
+    # Tool-progress batching rides the plugin's pre_tool_call hook.
+    assert [cb.__name__ for cb in ctx.hooks.get("pre_tool_call", [])] == ["_on_pre_tool_call"]
 
     # Tool + skill.
     assert [t["name"] for t in ctx.tools] == ["napcat_call"]
@@ -190,3 +197,67 @@ class TestStandaloneSend:
         cfg = PlatformConfig(enabled=True, extra={"http_url": "http://127.0.0.1:3000", "token": "t"})
         result = asyncio.run(_standalone_send(cfg, "not-a-number", "hi"))
         assert "invalid chat_id" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# pre_tool_call hook → batched tool progress
+# ---------------------------------------------------------------------------
+
+
+class _RecordingAdapter:
+    """Weak-referenceable stand-in for a live adapter."""
+
+    def __init__(self, raises: bool = False):
+        self.calls: list[tuple] = []
+        self._raises = raises
+
+    def note_tool_call(self, tool_name, args=None):
+        if self._raises:
+            raise RuntimeError("find me in a debug log, not in the tool call")
+        self.calls.append((tool_name, args))
+
+
+def test_pre_tool_call_hook_reaches_live_adapters():
+    plugin._ADAPTERS.clear()
+    adapter = _RecordingAdapter()
+    plugin._ADAPTERS.add(adapter)
+    try:
+        plugin._on_pre_tool_call("terminal", {"command": "ls"}, task_id="t1", extra=1)
+        assert adapter.calls == [("terminal", {"command": "ls"})]
+    finally:
+        plugin._ADAPTERS.discard(adapter)
+
+
+def test_adapter_factory_registers_the_adapter_for_the_hook():
+    from gateway.config import PlatformConfig
+
+    plugin._ADAPTERS.clear()
+    adapter = plugin._build_adapter(PlatformConfig(enabled=True, extra={"token": "t"}))
+    try:
+        assert adapter in plugin._ADAPTERS
+    finally:
+        plugin._ADAPTERS.discard(adapter)
+
+
+def test_pre_tool_call_hook_swallows_adapter_errors():
+    # pre_tool_call is a policy hook: a raising observer must never veto the
+    # tool call, so one bad adapter cannot stop the others from being fed.
+    plugin._ADAPTERS.clear()
+    bad, good = _RecordingAdapter(raises=True), _RecordingAdapter()
+    plugin._ADAPTERS.update({bad, good})
+    try:
+        plugin._on_pre_tool_call("terminal", {})  # must not raise
+        assert good.calls == [("terminal", {})]
+    finally:
+        plugin._ADAPTERS.clear()
+
+
+def test_register_survives_a_host_without_register_hook():
+    # Older/embedded hosts may not expose the hook API: registration must still
+    # succeed (batching just stays inactive).
+    class _HooklessCtx(_FakeCtx):
+        register_hook = None
+
+    ctx = _HooklessCtx()
+    plugin.register(ctx)
+    assert ctx.platform is not None

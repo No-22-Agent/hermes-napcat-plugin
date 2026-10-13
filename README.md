@@ -186,6 +186,53 @@ napcat_call("upload_group_file",     {"group_id": 12345678, "file": "/var/log/ap
 
 ---
 
+## 工具进度批处理（可选）
+
+QQ 没有"编辑已发送消息"的能力（OneBot 11 无对应接口），所以 Hermes 自带的逐工具进度
+在这条通道上会变成**一次工具调用一条消息**——一个长回合十几条，每条都是一次手机通知。
+上游只在支持编辑的平台上合并进度，没有批处理开关；本插件把这件事做在插件侧，不需要
+改动 Hermes 源码。
+
+**1) 关掉网关自带的那条 rail：**
+
+```yaml
+display:
+  platforms:
+    napcat:
+      tool_progress: off
+```
+
+**2) 打开插件的批处理**（`config.yaml` 的 `platforms.napcat.extra`，或 `.env` 里的同名变量）：
+
+```yaml
+platforms:
+  napcat:
+    extra:
+      progress_batch: true          # NAPCAT_PROGRESS_BATCH
+      progress_batch_size: 5        # NAPCAT_PROGRESS_BATCH_SIZE
+      progress_batch_window_s: 30   # NAPCAT_PROGRESS_BATCH_WINDOW_S
+```
+
+**行为：**
+
+- 攒满 `progress_batch_size` 条（默认 5）立即发出一条；
+- 从**第一条**待发起的 `progress_batch_window_s` 秒（默认 30）到点也发一条，
+  所以慢回合不会一直静默；
+- 回合结束（网关清除 typing）与连接断开时，剩余批次会被发掉或清空，不会拖到下一回合；
+- Agent 中途说话、或给出最终回复时，已攒的工具行会**并进那条消息本身**：工具行在上、
+  一条横线分隔、正文在下，而不是再多发一条气泡。同一次发送内完成，所以**顺序不会乱**
+  （QQ 不能改消息，晚发就会让工具行跑到后面去）；
+- 媒体消息（图片 / 语音 / 视频 / 文件）例外：说明文字不是 Agent 的正文，它们的工具行仍单独发一条；
+- `progress_batch` 打开但 `tool_progress` 没关时，首次工具调用会在日志里给出明确警告
+  （否则每次调用会多收一条未缓冲的消息）。
+
+工具行形如 `🖥 terminal · git status`，一行一次调用、单行上限 140 字符；与正文合并时用一条
+`──────────` 横线分隔（刻意用制表符而不是 ASCII 的 `---`，后者会被 Markdown 清洗规则改写成
+插件自己的横线）。
+批处理依赖插件的 `pre_tool_call` 钩子；宿主不提供该钩子时会静默降级为"无批量进度"。
+
+---
+
 ## 环境变量一览
 
 | 变量 | 说明 | 默认值 |
@@ -219,7 +266,9 @@ python -m pytest tests/ -q
 
 覆盖：握手鉴权、入站管道（标记化 / @门控 / 引用上下文 / 去重 / 白名单）、
 出站（分块 / Markdown 剥离 / 媒体段 / `upload_file_stream` / 超时不重试 /
-文本回退）、`napcat_call` 工具（校验 / 错误形态 / 响应整形）、注册面冒烟。
+文本回退）、`napcat_call` 工具（校验 / 错误形态 / 响应整形）、注册面冒烟、
+工具进度批处理（批次阈值 / 时间窗不从最后一条起算 / 发送前落地时序 / 回合结束与
+断连清理 / 行渲染与参数摘要）。
 
 ---
 
